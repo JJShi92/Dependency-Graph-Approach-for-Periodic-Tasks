@@ -1,0 +1,180 @@
+diff -Naur liblitmus-original/bin/rtspin.c liblitmus-hdga-listedf/bin/rtspin.c
+--- liblitmus-original/bin/rtspin.c	2017-09-14 23:58:28.000000000 +0200
++++ liblitmus-hdga-listedf/bin/rtspin.c	2019-02-12 12:33:02.226553627 +0100
+@@ -304,7 +304,8 @@
+ 
+ 	if (lock_od >= 0) {
+ 		/* simulate critical section somewhere in the middle */
+-		chunk1 = drand48() * (exec_time - cs_length);
++		// chunk1 = drand48() * (exec_time - cs_length);
++		chunk1 = 0.5 * (exec_time - cs_length);
+ 		chunk2 = exec_time - cs_length - chunk1;
+ 
+ 		/* non-critical section */
+@@ -335,8 +336,12 @@
+ 
+ 	return ms2ns(iat_ms);
+ }
++//j: number of jobs within one tasks;
++//J: number of jobs within one hyperperiod;
++//P: jobs order within one task
++//N: execution time for second non-critical setion
+ 
+-#define OPTSTR "p:c:wlveo:s:m:q:r:X:L:Q:iRu:U:Bhd:C:S::O::TD:E:A:a:"
++#define OPTSTR "p:c:wlveo:s:m:q:r:X:L:Q:M:iRu:U:Bhd:C:S::O::TD:E:A:a:j:J:P:N:"
+ 
+ int main(int argc, char** argv)
+ {
+@@ -403,6 +408,22 @@
+ 	int protocol = -1;
+ 	double cs_length = 1; /* millisecond */
+ 
++	/* Migrate support */
++	int if_migrate = 0;
++	int mig_to_cpu = 0;
++	int sem_target_cpu = 0;
++
++	/* dependency graph approach */
++
++	int job_order[32];
++	int total_jobs = -1;
++	int total_tasks = -1;
++	double relative_ddls[2];
++	double scnd_ncs = 0;
++	int op = 0;
++	char *token;
++	/* jobs order */
++
+ 	progname = argv[0];
+ 
+ 	while ((opt = getopt(argc, argv, OPTSTR)) != -1) {
+@@ -440,6 +461,29 @@
+ 		case 'B':
+ 			background_loop = 1;
+ 			break;
++		case 'j':
++			total_jobs = atoi(optarg);
++			if (total_jobs <= 0){
++				usage("Invalid job numver within one task.");
++			}
++			break;
++		case 'J':
++			total_tasks = atoi(optarg);
++			if (total_tasks <= 0){
++				usage("Invalid total jobs within one hyperperiod.");
++			}
++			break;
++		case 'P':
++			token = strtok(optarg, ":");
++			while (token != NULL){
++			    job_order[op] = atoi(token);
++			    op ++;
++			    token = strtok(NULL, ":");
++			}
++			break;
++		case 'N':
++			scnd_ncs = want_non_negative_double(optarg, "-N");
++			break;
+ 		case 'C':
+ 			after_colon = strsplit(':', optarg);
+ 			cost_csv_file = optarg;
+@@ -521,14 +565,17 @@
+ 		case 'X':
+ 			protocol = lock_protocol_for_name(optarg);
+ 			if (protocol < 0)
+-				usage("Unknown locking protocol specified.");
++				usage("Unknown locking protocol specified :( !");
+ 			break;
+ 		case 'L':
+ 			cs_length = want_positive_double(optarg, "-L");
+ 			break;
+ 		case 'Q':
+ 			resource_id = want_non_negative_int(optarg, "-Q");
+-
++			break;
++		case 'M':
++			mig_to_cpu = atoi(optarg);
++			if_migrate = 1;
+ 			break;
+ 		case 'v':
+ 			verbose = 1;
+@@ -658,6 +705,16 @@
+ 	param.exec_cost = wcet;
+ 	param.period = period;
+ 	param.phase  = phase;
++	for(int kk = 0; kk < total_jobs; kk++) {
++		param.job_order[kk] = job_order[kk];
++	}
++	param.total_jobs = total_jobs;
++	param.total_tasks = total_tasks;
++	relative_ddls[0] = cs_length;
++	relative_ddls[1] = scnd_ncs;
++	for(int kk = 0; kk < 2; kk++) {
++		param.relative_ddls[kk] = relative_ddls[kk];
++	}
+ 	param.relative_deadline = deadline;
+ 	param.priority = priority == LITMUS_NO_PRIORITY ? LITMUS_LOWEST_PRIORITY : priority;
+ 	param.cls = class;
+@@ -702,7 +759,12 @@
+ 
+ 	if (protocol >= 0) {
+ 		/* open reference to semaphore */
+-		lock_od = litmus_open_lock(protocol, resource_id, lock_namespace, &cluster);
++		if (if_migrate >= 1) {
++			sem_target_cpu = mig_to_cpu;
++		} else {
++			sem_target_cpu = cluster;
++		}
++		lock_od = litmus_open_lock(protocol, resource_id, lock_namespace, &sem_target_cpu);
+ 		if (lock_od < 0) {
+ 			perror("litmus_open_lock");
+ 			usage("Could not open lock.");
+diff -Naur liblitmus-original/include/litmus.h liblitmus-hdga-listedf/include/litmus.h
+--- liblitmus-original/include/litmus.h	2017-09-14 23:58:28.000000000 +0200
++++ liblitmus-hdga-listedf/include/litmus.h	2018-10-03 13:22:38.717713000 +0200
+@@ -178,6 +178,7 @@
+ 	DPCP_SEM	= 4, /**< Distributed Priority Ceiling Protocol */
+ 	PCP_SEM		= 5, /**< Priority Ceiling Protocol */
+ 	DFLP_SEM	= 6, /**< Distributed FIFO Locking Protocol */
++	HDGA_SEM	= 7, /**< Harmonic Dependency Graph Approach */
+ } obj_type_t;
+ 
+ /**
+@@ -395,6 +396,17 @@
+ }
+ 
+ /**
++ * Allocate a semaphore following the HDGA protocol
++ * @param fd File descriptor to associate lock with
++ * @param name Name of the lock, user-chosen integer
++ * @return Object descriptor for given lock
++ */
++static inline int open_hdga_sem(int fd, int name)
++{
++	return od_open(fd, HDGA_SEM, name);
++}
++
++/**
+  * Allocate a semaphore following the SRP protocol
+  * @param fd File descriptor to associate lock with
+  * @param name Name of the lock, user-chosen integer
+diff -Naur liblitmus-original/src/litmus.c liblitmus-hdga-listedf/src/litmus.c
+--- liblitmus-original/src/litmus.c	2017-09-14 23:58:28.000000000 +0200
++++ liblitmus-hdga-listedf/src/litmus.c	2018-10-03 15:59:29.925761000 +0200
+@@ -27,6 +27,7 @@
+ 	LP(DPCP),
+ 	LP(PCP),
+ 	LP(DFLP),
++	LP(HDGA),
+ };
+ 
+ #define NUM_PROTOS (sizeof(protocol)/sizeof(protocol[0]))
+@@ -104,6 +105,8 @@
+ 	tp->priority = LITMUS_LOWEST_PRIORITY;
+ 	tp->budget_policy = NO_ENFORCEMENT;
+ 	tp->release_policy = TASK_SPORADIC;
++	tp->total_jobs=0;
++	tp->total_tasks=0;
+ }
+ 
+ task_class_t str2class(const char* str)

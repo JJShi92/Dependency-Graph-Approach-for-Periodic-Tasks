@@ -1,0 +1,695 @@
+diff -Naur litmus-rt-original/include/litmus/fdso.h litmus-rt-hdga/include/litmus/fdso.h
+--- litmus-rt-original/include/litmus/fdso.h	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/include/litmus/fdso.h	2018-10-02 16:37:16.528384172 +0200
+@@ -26,8 +26,9 @@
+ 	PCP_SEM         = 5,
+ 
+ 	DFLP_SEM	= 6,
++	HDGA_SEM	= 7,
+ 
+-	MAX_OBJ_TYPE	= 6
++	MAX_OBJ_TYPE	= 7
+ } obj_type_t;
+ 
+ struct inode_obj_id {
+diff -Naur litmus-rt-original/include/litmus/litmus.h litmus-rt-hdga/include/litmus/litmus.h
+--- litmus-rt-original/include/litmus/litmus.h	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/include/litmus/litmus.h	2018-10-05 16:55:52.902806204 +0200
+@@ -27,6 +27,7 @@
+ }
+ 
+ struct task_struct* __waitqueue_remove_first(wait_queue_head_t *wq);
++struct task_struct* __check_waitqueue_first(wait_queue_head_t *wq);
+ 
+ #define NO_CPU			0xffffffff
+ 
+@@ -70,6 +71,11 @@
+ #define get_rt_phase(t)		(tsk_rt(t)->task_params.phase)
+ #define get_partition(t) 	(tsk_rt(t)->task_params.cpu)
+ #define get_priority(t) 	(tsk_rt(t)->task_params.priority)
++#define get_jobno(t)		(tsk_rt(t)->job_params.job_no)
++#define get_total_jobs(t)	(tsk_rt(t)->task_params.total_jobs)
++#define get_rt_order(t)		(tsk_rt(t)->task_params.job_order)
++#define get_rt_total(t)		(tsk_rt(t)->task_params.total_tasks)
++
+ #define get_class(t)        (tsk_rt(t)->task_params.cls)
+ #define get_release_policy(t) (tsk_rt(t)->task_params.release_policy)
+ 
+diff -Naur litmus-rt-original/include/litmus/rt_param.h litmus-rt-hdga/include/litmus/rt_param.h
+--- litmus-rt-original/include/litmus/rt_param.h	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/include/litmus/rt_param.h	2018-10-02 22:29:45.073402265 +0200
+@@ -122,6 +122,12 @@
+ 	task_class_t	cls;
+ 	budget_policy_t  budget_policy;  /* ignored by pfair */
+ 	release_policy_t release_policy;
++	/* the jobs' order within one task */
++	unsigned int	job_order[32];
++	/* the number of jobs within one hyper period */
++	unsigned int	total_jobs;
++	/* the total number of jobs within one hyper period */
++	unsigned int	total_tasks;
+ };
+ 
+ /* don't export internal data structures to user space (liblitmus) */
+diff -Naur litmus-rt-original/include/litmus/wait.h litmus-rt-hdga/include/litmus/wait.h
+--- litmus-rt-original/include/litmus/wait.h	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/include/litmus/wait.h	2018-10-02 17:16:00.270550020 +0200
+@@ -2,6 +2,7 @@
+ #define _LITMUS_WAIT_H_
+ 
+ struct task_struct* __waitqueue_remove_first(wait_queue_head_t *wq);
++struct task_struct* __check_waitqueue_first(wait_queue_head_t *wq);
+ 
+ /* wrap regular wait_queue_t head */
+ struct __prio_wait_queue {
+diff -Naur litmus-rt-original/litmus/fdso.c litmus-rt-hdga/litmus/fdso.c
+--- litmus-rt-original/litmus/fdso.c	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/litmus/fdso.c	2019-02-12 10:45:46.318780131 +0100
+@@ -28,6 +28,7 @@
+ 	&generic_lock_ops, /* DPCP_SEM */
+ 	&generic_lock_ops, /* PCP_SEM */
+ 	&generic_lock_ops, /* DFLP_SEM */
++	&generic_lock_ops, /* HDGA_SEM */
+ };
+ 
+ static int fdso_create(void** obj_ref, obj_type_t type, void* __user config)
+diff -Naur litmus-rt-original/litmus/locking.c litmus-rt-hdga/litmus/locking.c
+--- litmus-rt-original/litmus/locking.c	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/litmus/locking.c	2019-02-12 10:45:46.330780168 +0100
+@@ -139,6 +139,18 @@
+ 	return(t);
+ }
+ 
++struct task_struct* __check_waitqueue_first(wait_queue_head_t *wq)
++{
++	wait_queue_t* q;
++	struct task_struct* t = NULL;
++
++	if (waitqueue_active(wq)) {
++		q = list_entry(wq->task_list.next, wait_queue_t, task_list);
++		t = (struct task_struct*) q->private;
++	}
++	return(t);
++}
++
+ unsigned int __add_wait_queue_prio_exclusive(
+ 	wait_queue_head_t* head,
+ 	prio_wait_queue_t *new)
+diff -Naur litmus-rt-original/litmus/sched_gsn_edf.c litmus-rt-hdga/litmus/sched_gsn_edf.c
+--- litmus-rt-original/litmus/sched_gsn_edf.c	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/litmus/sched_gsn_edf.c	2019-02-12 10:45:46.342780204 +0100
+@@ -26,6 +26,8 @@
+ #include <litmus/np.h>
+ 
+ #include <litmus/bheap.h>
++#include <litmus/affinity.h>
++#include <litmus/wait.h>
+ 
+ #ifdef CONFIG_SCHED_CPU_AFFINITY
+ #include <litmus/affinity.h>
+@@ -33,7 +35,7 @@
+ 
+ /* to set up domain/cpu mappings */
+ #include <litmus/litmus_proc.h>
+-
++#include <linux/uaccess.h>
+ #include <linux/module.h>
+ 
+ /* Overview of GSN-EDF operations.
+@@ -238,6 +240,11 @@
+ 	}
+ }
+ 
++static lt_t prio_point(int eprio)
++{
++	/* make sure we have non-negative prio points */
++	return eprio + LITMUS_MAX_PRIORITY;
++}
+ 
+ /* preempt - force a CPU to reschedule
+  */
+@@ -924,6 +931,268 @@
+ 	return &sem->litmus_lock;
+ }
+ 
++/* ******************** HDGA support ********************** */
++
++struct hdga_semaphore {
++	struct litmus_lock litmus_lock;
++
++	/* current resource holder */
++	struct task_struct *owner;
++
++	/* priority queue of waiting tasks */
++	/* here ordered by dependency graph */
++	wait_queue_head_t wait;
++
++	/* highest-priority waiter */
++	//struct task_struct *hp_waiter;
++
++	/* current serving task */
++	atomic_t serving_ticket;
++};
++
++static inline struct hdga_semaphore* hdga_from_lock(struct litmus_lock* lock)
++{
++	return container_of(lock, struct hdga_semaphore, litmus_lock);
++}
++
++/* caller is responsible for locking */
++//struct task_struct* find_hp_waiter_hdga(struct hdga_semaphore *sem,
++//				   struct task_struct* skip)
++//{
++//	struct list_head	*pos;
++//	struct task_struct 	*queued, *found = NULL;
++
++//	list_for_each(pos, &sem->wait.task_list) {
++//		queued  = (struct task_struct*) list_entry(pos, wait_queue_t,
++//							   task_list)->private;
++
++//		/* Compare task prios, find high prio task. */
++//		if (queued != skip && edf_higher_prio(queued, found))
++//			found = queued;
++//	}
++//	return found;
++//}
++
++int gsnedf_hdga_lock(struct litmus_lock* l)
++{
++	struct task_struct* t = current;
++	struct hdga_semaphore *sem = hdga_from_lock(l);
++	/* priority wait queue ordered by the dependency graph */
++	prio_wait_queue_t wait;
++	unsigned long flags;
++
++	unsigned int current_serving_ticket;
++    int task_order;
++    unsigned int job_number;
++    unsigned int total_jobs;
++    int order_index;
++
++	if (!is_realtime(t))
++		return -EPERM;
++
++	/* prevent nested lock acquisition */
++	if (tsk_rt(t)->num_locks_held ||
++	    tsk_rt(t)->num_local_locks_held)
++		return -EBUSY;
++
++	preempt_disable();
++
++	spin_lock_irqsave(&sem->wait.lock, flags);
++
++    current_serving_ticket = atomic_read(&sem->serving_ticket);
++    job_number = get_jobno(t);
++    total_jobs = get_total_jobs(t);
++    order_index = (int)((job_number-3) % total_jobs);
++    task_order = get_rt_order(t)[order_index];
++
++	//preempt_enable_no_resched();
++	TRACE_TASK(T, "Request a resource, current serving ticket is:%d, current job ticket is:%d", current_serving_ticket, task_order);
++	/* if the semaphore is occupied or the order is not correct */
++	if (sem->owner || current_serving_ticket != task_order) {
++		/* resource is not free => must suspend and wait */
++
++		/* ordered by the dependency order */
++		init_prio_waitqueue_entry(&wait, t, prio_point(task_order));
++
++		/* FIXME: interruptible would be nice some day */
++		set_task_state(t, TASK_UNINTERRUPTIBLE);
++
++		__add_wait_queue_prio_exclusive(&sem->wait, &wait);
++
++		/* check if we need to activate priority inheritance */
++		//if (edf_higher_prio(t, sem->hp_waiter)) {
++		//	sem->hp_waiter = t;
++		//	if (edf_higher_prio(t, sem->owner))
++		//		set_priority_inheritance(sem->owner, sem->hp_waiter);
++		//}
++
++		TS_LOCK_SUSPEND;
++
++		/* release lock before sleeping */
++		
++		spin_unlock_irqrestore(&sem->wait.lock, flags);
++
++		preempt_enable_no_resched();
++		schedule();
++
++		preempt_disable();
++		TS_LOCK_RESUME;
++
++		/* Since we hold the lock, no other task will change
++		 * ->owner. We can thus check it without acquiring the spin
++		 * lock. */
++		BUG_ON(sem->owner != t);
++	} else {
++		/* it's ours now */
++		sem->owner = t;
++		spin_unlock_irqrestore(&sem->wait.lock, flags);
++	}
++
++	tsk_rt(t)->num_locks_held++;
++
++	preempt_enable();
++	return 0;
++
++}
++
++int gsnedf_hdga_unlock(struct litmus_lock* l)
++{
++	struct task_struct *t = current;
++	struct task_struct *next = NULL;
++	struct task_struct *next_candi = NULL;
++	struct hdga_semaphore *sem = hdga_from_lock(l);
++	unsigned long flags;
++	int err = 0;
++
++	unsigned int next_serving_ticket = -1;
++	unsigned int task_order = -1;
++	unsigned int max_serving_ticket = -1;
++    unsigned int job_number;
++    unsigned int total_jobs;
++    int order_index;
++
++    preempt_disable();
++
++	spin_lock_irqsave(&sem->wait.lock, flags);
++
++	if (sem->owner != t) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	max_serving_ticket = get_rt_total(t) - 1;
++
++	tsk_rt(t)->num_locks_held--;
++
++	/* go to next task */
++	atomic_add(1, &sem->serving_ticket);
++
++	next_serving_ticket = atomic_read(&sem->serving_ticket);
++
++	/* one graph is finished, starts next iteration */
++	if (next_serving_ticket > max_serving_ticket) {
++		next_serving_ticket = 0;
++		atomic_set(&sem->serving_ticket, 0);
++	}
++
++	/* check if there are jobs waiting for this resource */
++	next_candi = __check_waitqueue_first(&sem->wait);
++
++	if (next_candi) {
++        job_number = get_jobno(next_candi);
++        total_jobs = get_total_jobs(next_candi);
++        order_index = (int)((job_number-3)%total_jobs);
++        task_order = get_rt_order(next_candi)[order_index];
++	TRACE_TASK(next_candi, "Next candidate, next serving ticket is:%d, next candi ticket is:%d", next_serving_ticket, task_order);
++	}
++
++	if (task_order == next_serving_ticket) {
++		next = __waitqueue_remove_first(&sem->wait);
++	} else {
++		sem->owner = NULL;
++	}
++
++	if (next) {
++		/* next becomes the resouce holder */
++		sem->owner = next;
++		/* determine new hp_waiter if necessary */
++		//if (next == sem->hp_waiter) {
++
++		//	sem->hp_waiter = find_hp_waiter_hdga(sem, next);
++		//} else {
++		//	set_priority_inheritance(next, sem->hp_waiter);
++		//}
++		/* wake up next */
++		wake_up_process(next);
++	} else
++		/* resource becomes available */
++		sem->owner = NULL;
++
++		/* we lose the benefit of priority inheritance (if any) */
++	//if (tsk_rt(t)->inh_task)
++	//	clear_priority_inheritance(t);
++
++out:
++	spin_unlock_irqrestore(&sem->wait.lock, flags);
++
++	preempt_enable();
++
++	return err;
++}
++
++/* gsnedf_hdga_open is needed or not? */
++/* transfer the dependency graph using config? */
++
++int gsnedf_hdga_close(struct litmus_lock* l)
++{
++	struct task_struct *t = current;
++	struct hdga_semaphore *sem = hdga_from_lock(l);
++	unsigned long flags;
++
++	int owner;
++
++	spin_lock_irqsave(&sem->wait.lock, flags);
++
++	owner = sem->owner == t;
++
++	spin_unlock_irqrestore(&sem->wait.lock, flags);
++
++	if (owner)
++		gsnedf_hdga_unlock(l);
++
++	return 0;
++}
++
++void gsnedf_hdga_free(struct litmus_lock* lock)
++{
++	kfree(hdga_from_lock(lock));
++}
++
++static struct litmus_lock_ops gsnedf_hdga_lock_ops = {
++	.close  = gsnedf_hdga_close,
++	.lock   = gsnedf_hdga_lock,
++	.unlock = gsnedf_hdga_unlock,
++	.deallocate = gsnedf_hdga_free,
++};
++
++static struct litmus_lock* gsnedf_new_hdga(void)
++{
++	struct hdga_semaphore* sem;
++
++	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
++	if (!sem)
++		return NULL;
++
++	sem->owner   = NULL;
++	init_waitqueue_head(&sem->wait);
++	sem->litmus_lock.ops = &gsnedf_hdga_lock_ops;
++	atomic_set(&sem->serving_ticket, 0);
++
++	return &sem->litmus_lock;
++}
++
++
++
+ /* **** lock constructor **** */
+ 
+ 
+@@ -941,6 +1210,15 @@
+ 		if (*lock)
+ 			err = 0;
+ 		else
++			err = -ENOMEM;
++		break;
++
++	case HDGA_SEM:
++		/* Harmonic Dependency Graph Approach */
++		*lock = gsnedf_new_hdga();
++		if (*lock)
++			err = 0;
++		else
+ 			err = -ENOMEM;
+ 		break;
+ 
+diff -Naur litmus-rt-original/litmus/sched_psn_edf.c litmus-rt-hdga/litmus/sched_psn_edf.c
+--- litmus-rt-original/litmus/sched_psn_edf.c	2017-07-12 22:57:41.000000000 +0200
++++ litmus-rt-hdga/litmus/sched_psn_edf.c	2019-02-12 10:45:46.362780265 +0100
+@@ -24,9 +24,11 @@
+ #include <litmus/edf_common.h>
+ #include <litmus/sched_trace.h>
+ #include <litmus/trace.h>
++#include <litmus/wait.h>
+ 
+ /* to set up domain/cpu mappings */
+ #include <litmus/litmus_proc.h>
++#include <linux/uaccess.h>
+ 
+ typedef struct {
+ 	rt_domain_t 		domain;
+@@ -159,6 +161,12 @@
+ 	return psnedf_preempt_check(pedf);
+ }
+ 
++static lt_t prio_point(int eprio)
++{
++	/* make sure we have non-negative prio points */
++	return eprio + LITMUS_MAX_PRIORITY;
++}
++
+ static void job_completion(struct task_struct* t, int forced)
+ {
+ 	sched_trace_task_completion(t, forced);
+@@ -537,6 +545,235 @@
+ 	return &sem->litmus_lock;
+ }
+ 
++/* ******************** HDGA support ********************** */
++struct hdga_semaphore {
++	struct litmus_lock litmus_lock;
++
++	/* current resource holder */
++	struct task_struct *owner;
++
++	/* priority queue of waiting tasks */
++	/* here ordered by dependency graph */
++	wait_queue_head_t wait;
++
++	/* ceiling priority is not needed */
++
++	/* current serving task */
++	atomic_t serving_ticket;
++};
++
++static inline struct hdga_semaphore* hdga_from_lock(struct litmus_lock* lock)
++{
++	return container_of(lock, struct hdga_semaphore, litmus_lock);
++}
++
++int psnedf_hdga_lock(struct litmus_lock* l)
++{
++	struct task_struct* t = current;
++	struct hdga_semaphore *sem = hdga_from_lock(l);
++	/* priority wait queue ordered by the dependency graph */
++	prio_wait_queue_t wait;
++	unsigned long flags;
++
++	unsigned int current_serving_ticket;
++    int task_order;
++    unsigned int job_number;
++    unsigned int total_jobs;
++    int order_index;
++
++	if (!is_realtime(t))
++		return -EPERM;
++
++	/* prevent nested lock acquisition */
++	if (tsk_rt(t)->num_locks_held ||
++	    tsk_rt(t)->num_local_locks_held)
++		return -EBUSY;
++
++	preempt_disable();
++
++	spin_lock_irqsave(&sem->wait.lock, flags);
++
++    current_serving_ticket = atomic_read(&sem->serving_ticket);
++    job_number = get_jobno(t);
++    total_jobs = get_total_jobs(t);
++    order_index = (int)((job_number-3) % total_jobs);
++    task_order = get_rt_order(t)[order_index];
++
++	/* if the semaphore is occupied or the order is not correct */
++	if (sem->owner || current_serving_ticket != task_order) {
++		/* resource is not free => must suspend and wait */
++
++		/* ordered by the dependency order */
++		init_prio_waitqueue_entry(&wait, t, prio_point(task_order));
++
++		/* FIXME: interruptible would be nice some day */
++		set_task_state(t, TASK_UNINTERRUPTIBLE);
++
++		__add_wait_queue_prio_exclusive(&sem->wait, &wait);
++
++		TS_LOCK_SUSPEND;
++
++		/* release lock before sleeping */
++		preempt_enable_no_resched();
++		spin_unlock_irqrestore(&sem->wait.lock, flags);
++
++		schedule();
++
++		TS_LOCK_RESUME;
++
++		/* Since we hold the lock, no other task will change
++		 * ->owner. We can thus check it without acquiring the spin
++		 * lock. */
++		BUG_ON(sem->owner != t);
++	} else {
++		/* it's ours now */
++		sem->owner = t;
++
++		/* mark the task as priority-boosted. */
++		boost_priority(t);
++        preempt_enable_no_resched();
++		spin_unlock_irqrestore(&sem->wait.lock, flags);
++	}
++
++	tsk_rt(t)->num_locks_held++;
++
++	return 0;
++
++}
++
++int psnedf_hdga_unlock(struct litmus_lock* l)
++{
++	struct task_struct *t = current;
++	struct task_struct *next = NULL;
++	struct task_struct *next_candi = NULL;
++	struct hdga_semaphore *sem = hdga_from_lock(l);
++	unsigned long flags;
++	int err = 0;
++
++	unsigned int next_serving_ticket = -1;
++	unsigned int task_order = -1;
++	unsigned int max_serving_ticket = -1;
++    unsigned int job_number;
++    unsigned int total_jobs;
++    int order_index;
++
++    preempt_disable();
++
++	spin_lock_irqsave(&sem->wait.lock, flags);
++
++	if (sem->owner != t) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	max_serving_ticket = get_rt_total(t) - 1;
++
++	tsk_rt(t)->num_locks_held--;
++
++	/* go to next task */
++	atomic_add(1, &sem->serving_ticket);
++
++	next_serving_ticket = atomic_read(&sem->serving_ticket);
++
++	/* one graph is finished, starts next iteration */
++	if (next_serving_ticket > max_serving_ticket) {
++		next_serving_ticket = 0;
++		atomic_set(&sem->serving_ticket, 0);
++	}
++
++	/* we lose the benefit of priority boosting */
++
++	unboost_priority(t);
++
++	/* check if there are jobs waiting for this resource */
++	next_candi = __check_waitqueue_first(&sem->wait);
++
++	if (next_candi) {
++        job_number = get_jobno(next_candi);
++        total_jobs = get_total_jobs(next_candi);
++        order_index = (int)((job_number-3)%total_jobs);
++        task_order = get_rt_order(next_candi)[order_index];
++	}
++
++	if (task_order == next_serving_ticket) {
++		next = __waitqueue_remove_first(&sem->wait);
++	} else {
++		sem->owner = NULL;
++	}
++
++	if (next) {
++		/* boost next job */
++		boost_priority(next);
++
++		/* next becomes the resouce holder */
++		sem->owner = next;
++
++		/* wake up next */
++		wake_up_process(next);
++	} else
++		/* resource becomes available */
++		sem->owner = NULL;
++
++out:
++	spin_unlock_irqrestore(&sem->wait.lock, flags);
++
++	preempt_enable();
++
++	return err;
++}
++
++/* psnedf_hdga_open is needed or not? */
++/* transfer the dependency graph using config? */
++
++int psnedf_hdga_close(struct litmus_lock* l)
++{
++	struct task_struct *t = current;
++	struct hdga_semaphore *sem = hdga_from_lock(l);
++	unsigned long flags;
++
++	int owner;
++
++	spin_lock_irqsave(&sem->wait.lock, flags);
++
++	owner = sem->owner == t;
++
++	spin_unlock_irqrestore(&sem->wait.lock, flags);
++
++	if (owner)
++		psnedf_hdga_unlock(l);
++
++	return 0;
++}
++
++void psnedf_hdga_free(struct litmus_lock* lock)
++{
++	kfree(hdga_from_lock(lock));
++}
++
++static struct litmus_lock_ops psnedf_hdga_lock_ops = {
++	.close  = psnedf_hdga_close,
++	.lock   = psnedf_hdga_lock,
++	.unlock = psnedf_hdga_unlock,
++	.deallocate = psnedf_hdga_free,
++};
++
++static struct litmus_lock* psnedf_new_hdga(void)
++{
++	struct hdga_semaphore* sem;
++
++	sem = kmalloc(sizeof(*sem), GFP_KERNEL);
++	if (!sem)
++		return NULL;
++
++	sem->owner   = NULL;
++	init_waitqueue_head(&sem->wait);
++	sem->litmus_lock.ops = &psnedf_hdga_lock_ops;
++	atomic_set(&sem->serving_ticket, 0);
++
++	return &sem->litmus_lock;
++}
++
++
+ /* **** lock constructor **** */
+ 
+ 
+@@ -555,6 +792,15 @@
+ 		if (*lock)
+ 			err = 0;
+ 		else
++			err = -ENOMEM;
++		break;
++
++	case HDGA_SEM:
++		/* Harmonic Dependency Graph Approach */
++		*lock = psnedf_new_hdga();
++		if (*lock)
++			err = 0;
++		else
+ 			err = -ENOMEM;
+ 		break;
+ 
