@@ -1,6 +1,6 @@
 #!/bin/bash
 PROT=HDGA
-TIME=600
+TIME=480
 rtspin -w -X $PROT -L 1 -Q 1 -j 8 -J 15 -P "0:2:4:6:8:10:12:14" 2 30 $TIME &
 sleep 1
 rtspin -w -X $PROT -L 1 -Q 1 -j 4 -J 15 -P "1:5:9:13" 2 60 $TIME &
